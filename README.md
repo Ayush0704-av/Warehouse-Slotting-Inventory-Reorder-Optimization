@@ -73,6 +73,100 @@ Since the dataset has no live inventory feed, current stock levels were simulate
 
 ---
 
+## 🧮 Key SQL Queries
+
+### ABC Classification
+```sql
+CREATE OR REPLACE VIEW abc_classification AS
+WITH ranked AS (
+    SELECT
+        stock_code,
+        description,
+        total_revenue,
+        SUM(total_revenue) OVER (ORDER BY total_revenue DESC) AS running_total,
+        SUM(total_revenue) OVER ()                             AS grand_total
+    FROM sku_demand_summary
+)
+SELECT
+    stock_code,
+    description,
+    total_revenue,
+    ROUND(running_total / grand_total * 100, 2) AS cumulative_pct,
+    CASE
+        WHEN running_total / grand_total <= 0.80 THEN 'A'
+        WHEN running_total / grand_total <= 0.95 THEN 'B'
+        ELSE 'C'
+    END AS abc_class
+FROM ranked;
+```
+
+### XYZ Classification (Demand Variability)
+```sql
+CREATE OR REPLACE VIEW xyz_classification AS
+SELECT
+    stock_code,
+    COUNT(*)                      AS active_months,
+    ROUND(AVG(monthly_qty), 2)    AS avg_monthly_qty,
+    ROUND(STDDEV(monthly_qty), 2) AS stddev_monthly_qty,
+    ROUND(STDDEV(monthly_qty) / AVG(monthly_qty), 3) AS cv,
+    CASE
+        WHEN STDDEV(monthly_qty) / AVG(monthly_qty) < 0.5 THEN 'X'
+        WHEN STDDEV(monthly_qty) / AVG(monthly_qty) < 1.0 THEN 'Y'
+        ELSE 'Z'
+    END AS xyz_class
+FROM sku_monthly_demand
+GROUP BY stock_code
+HAVING active_months >= 3;
+```
+
+### Warehouse Zone Simulation (biased ~20% misplacement rate)
+```sql
+INSERT INTO sku_zone_mapping (stock_code, zone_id, zone_type, distance_from_dock_m)
+SELECT
+    s.stock_code,
+    CONCAT('Z', MOD(CRC32(s.stock_code), 10) + 1) AS zone_id,
+    CASE
+        WHEN m.abc_xyz_class IN ('AX','AY','BX') THEN
+            CASE
+                WHEN MOD(CRC32(s.stock_code), 100) < 82 THEN 'fast_pick'
+                WHEN MOD(CRC32(s.stock_code), 100) < 88 THEN 'medium_pick'
+                WHEN MOD(CRC32(s.stock_code), 100) < 94 THEN 'slow_pick'
+                ELSE 'bulk_storage'
+            END
+        ELSE
+            CASE
+                WHEN MOD(CRC32(s.stock_code), 4) = 0 THEN 'fast_pick'
+                WHEN MOD(CRC32(s.stock_code), 4) = 1 THEN 'medium_pick'
+                WHEN MOD(CRC32(s.stock_code), 4) = 2 THEN 'slow_pick'
+                ELSE 'bulk_storage'
+            END
+    END AS zone_type,
+    10 + MOD(CRC32(s.stock_code), 90) AS distance_from_dock_m
+FROM sku_demand_summary s
+LEFT JOIN abc_xyz_matrix m ON s.stock_code = m.stock_code;
+```
+
+### Slotting Misplacement Flag
+```sql
+CREATE OR REPLACE VIEW slotting_misplacement AS
+SELECT
+    m.stock_code,
+    m.description,
+    m.abc_xyz_class,
+    m.total_revenue,
+    z.zone_type AS current_zone,
+    z.distance_from_dock_m,
+    CASE
+        WHEN m.abc_xyz_class IN ('AX','AY','BX') AND z.zone_type != 'fast_pick'
+            THEN 'MISPLACED'
+        ELSE 'OK'
+    END AS placement_status
+FROM abc_xyz_matrix m
+JOIN sku_zone_mapping z ON m.stock_code = z.stock_code;
+```
+
+---
+
 ## 📈 Key Results
 
 | Metric | Value |
